@@ -1,33 +1,21 @@
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::sync::Arc;
+use std::time::Instant;
 
 use aexecutor::SearcherExecutorPool;
 use anyhow::{anyhow, Error, Result};
 use hashbrown::HashMap;
 use serde::{Deserialize, Serialize};
 use tantivy::collector::{Count, TopDocs};
-use tantivy::fastfield::FastFieldReader;
 use tantivy::query::{Query, TermQuery};
 use tantivy::schema::{Field, FieldType, IndexRecordOption, Schema, Value};
-use tantivy::{
-    DateTime,
-    DocAddress,
-    DocId,
-    Executor,
-    IndexReader,
-    LeasedItem,
-    ReloadPolicy,
-    Score,
-    Searcher,
-    SegmentReader,
-    Term,
-};
+use tantivy::{DateTime, DocAddress, DocId, Executor, IndexReader, ReloadPolicy, Score, Searcher, SegmentReader, SnippetGenerator, Term};
 
 use crate::helpers::{AsScore, Validate};
 use crate::query::{DocumentId, QueryBuilder, QuerySelector};
 use crate::schema::SchemaContext;
-use crate::structures::{DocumentHit, IndexContext};
+use crate::structures::{CompliantDocumentValue, DocumentHit, IndexContext};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ReaderContext {
@@ -84,6 +72,14 @@ pub struct QueryPayload {
     /// How to sort the data (asc/desc).
     #[serde(default)]
     pub(crate) sort: Sort,
+
+    /// If you want to generate snippets you need to send the size of it
+    #[serde(default)]
+    pub(crate) snippet_size: Option<usize>,
+
+    /// If you want to generate snippet you need to set names of the fields that will be snipped
+    #[serde(default)]
+    pub(crate) snippet_fields: Vec<String>
 }
 
 impl QueryPayload {
@@ -140,7 +136,7 @@ impl QueryResults {
 fn order_and_search<R: AsScore + tantivy::fastfield::FastValue>(
     searcher: &Searcher,
     field: Field,
-    query: Box<dyn Query>,
+    query: &Box<dyn Query>,
     limit: usize,
     offset: usize,
     executor: &Executor,
@@ -150,7 +146,7 @@ fn order_and_search<R: AsScore + tantivy::fastfield::FastValue>(
     let collector = (collector, Count);
 
     let (result_addresses, count) = searcher
-        .search_with_executor(&query, &collector, executor)
+        .search_with_executor(query, &collector, executor)
         .map_err(Error::from)?;
 
     let results = result_addresses
@@ -186,26 +182,55 @@ fn process_search<S: AsScore>(
     searcher: &Searcher,
     schema: &Schema,
     top_docs: Vec<(S, DocAddress)>,
+    query: &Box<dyn Query>,
+    snippet_size: Option<usize>,
+    snippet_fields: Vec<String>,
 ) -> Result<Vec<DocumentHit>> {
+    println!("Process search, snippet_size = {:?}, snippet_fields = {:?}, query:\n{:#?}", &snippet_size, &snippet_fields, &query);
     let mut hits = Vec::with_capacity(top_docs.len());
+    let mut ms = 0;
+    //let start = Instant::now();
+    let mut snippet_generators = Vec::new();
+    for field_name in &snippet_fields {
+        match schema.get_field(field_name) {
+            Some(field) => {
+                let mut snippet_generator = SnippetGenerator::create(&searcher, &*query, field)?;
+                snippet_generator.set_max_num_chars(snippet_size.unwrap());
+                snippet_generators.push((field_name, snippet_generator));
+            }
+            None => {}
+        }
+    }
+    //ms += start.elapsed().as_millis();
     for (ratio, ref_address) in top_docs {
         let retrieved_doc = searcher.doc(ref_address)?;
+        let start = Instant::now();
+        let mut snippets = HashMap::new();
+        for (name, generator) in &snippet_generators {
+            let snippet = generator.snippet_from_doc(&retrieved_doc);
+            let html = snippet.to_html();
+            snippets.insert(*name, html);
+        }
+        ms += start.elapsed().as_millis();
+
         let mut doc = schema.to_named_doc(&retrieved_doc);
         let id = doc.0
             .remove("_id")
             .ok_or_else(|| Error::msg("document has been missed labeled (missing primary key '_id'), the dataset is invalid"))?;
 
         if let Value::U64(doc_id) = id[0] {
-            hits.push(DocumentHit::from_tantivy_document(
-                ctx,
-                doc_id,
-                doc,
-                ratio.as_score(),
-            ));
+            let mut hit = DocumentHit::from_tantivy_document(ctx, doc_id, doc, ratio.as_score());
+            for (field, snippet) in &snippets {
+                if let Some(value) = hit.doc.get_mut(field.as_str()) {
+                    *value = Some(CompliantDocumentValue::Single(Value::Str(snippet.to_owned())));
+                }
+            }
+            hits.push(hit);
         } else {
             return Err(Error::msg("document has been missed labeled (missing identifier tag), the dataset is invalid"));
         }
     }
+    println!("Time for snippet calculation: {} ms", ms);
 
     Ok(hits)
 }
@@ -225,6 +250,8 @@ fn order_and_sort(
     limit: usize,
     offset: usize,
     executor: &Executor,
+    snippet_size: Option<usize>,
+    snippet_fields: Vec<String>,
 ) -> Result<(Vec<DocumentHit>, usize)> {
     let is_multi_value = ctx
         .multi_value_fields()
@@ -241,23 +268,23 @@ fn order_and_sort(
         return match field_type {
             FieldType::I64(_) => {
                 let out: (Vec<(i64, DocAddress)>, usize) =
-                    order_and_search(searcher, field, query, limit, offset, executor)?;
-                Ok((process_search(ctx, searcher, schema, out.0)?, out.1))
+                    order_and_search(searcher, field, &query, limit, offset, executor)?;
+                Ok((process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1))
             },
             FieldType::U64(_) => {
                 let out: (Vec<(u64, DocAddress)>, usize) =
-                    order_and_search(searcher, field, query, limit, offset, executor)?;
-                Ok((process_search(ctx, searcher, schema, out.0)?, out.1))
+                    order_and_search(searcher, field, &query, limit, offset, executor)?;
+                Ok((process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1))
             },
             FieldType::F64(_) => {
                 let out: (Vec<(f64, DocAddress)>, usize) =
-                    order_and_search(searcher, field, query, limit, offset, executor)?;
-                Ok((process_search(ctx, searcher, schema, out.0)?, out.1))
+                    order_and_search(searcher, field, &query, limit, offset, executor)?;
+                Ok((process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1))
             },
             FieldType::Date(_) => {
                 let out: (Vec<(DateTime, DocAddress)>, usize) =
-                    order_and_search(searcher, field, query, limit, offset, executor)?;
-                Ok((process_search(ctx, searcher, schema, out.0)?, out.1))
+                    order_and_search(searcher, field, &query, limit, offset, executor)?;
+                Ok((process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1))
             },
             _ => Err(Error::msg("field is not a fast field")),
         };
@@ -274,7 +301,7 @@ fn order_and_sort(
                         .expect("field exists");
 
                     move |doc: DocId| {
-                        let value: i64 = reader.get(doc);
+                        let value: i64 = reader.get_val(doc);
                         std::cmp::Reverse(value)
                     }
                 });
@@ -282,7 +309,7 @@ fn order_and_sort(
             let out: (Vec<(Reverse<i64>, DocAddress)>, usize) = execute_staged_search!(
                 query, searcher, collector, executor, limit, offset
             )?;
-            (process_search(ctx, searcher, schema, out.0)?, out.1)
+            (process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1)
         },
         FieldType::U64(_) => {
             let collector =
@@ -293,7 +320,7 @@ fn order_and_sort(
                         .expect("field exists");
 
                     move |doc: DocId| {
-                        let value: u64 = reader.get(doc);
+                        let value: u64 = reader.get_val(doc);
                         std::cmp::Reverse(value)
                     }
                 });
@@ -301,7 +328,7 @@ fn order_and_sort(
             let out: (Vec<(Reverse<u64>, DocAddress)>, usize) = execute_staged_search!(
                 query, searcher, collector, executor, limit, offset
             )?;
-            (process_search(ctx, searcher, schema, out.0)?, out.1)
+            (process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1)
         },
         FieldType::F64(_) => {
             let collector =
@@ -312,7 +339,7 @@ fn order_and_sort(
                         .expect("field exists");
 
                     move |doc: DocId| {
-                        let value: f64 = reader.get(doc);
+                        let value: f64 = reader.get_val(doc);
                         std::cmp::Reverse(value)
                     }
                 });
@@ -320,7 +347,7 @@ fn order_and_sort(
             let out: (Vec<(Reverse<f64>, DocAddress)>, usize) = execute_staged_search!(
                 query, searcher, collector, executor, limit, offset
             )?;
-            (process_search(ctx, searcher, schema, out.0)?, out.1)
+            (process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1)
         },
         FieldType::Date(_) => {
             let collector =
@@ -331,7 +358,7 @@ fn order_and_sort(
                         .expect("field exists");
 
                     move |doc: DocId| {
-                        let value: DateTime = reader.get(doc);
+                        let value: DateTime = reader.get_val(doc);
                         std::cmp::Reverse(value)
                     }
                 });
@@ -339,7 +366,7 @@ fn order_and_sort(
             let out: (Vec<(Reverse<DateTime>, DocAddress)>, usize) = execute_staged_search!(
                 query, searcher, collector, executor, limit, offset
             )?;
-            (process_search(ctx, searcher, schema, out.0)?, out.1)
+            (process_search(ctx, searcher, schema, out.0, &query, snippet_size, snippet_fields)?, out.1)
         },
         _ => return Err(Error::msg("field is not a fast field")),
     };
@@ -374,7 +401,7 @@ impl Reader {
             .index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommit)
-            .num_searchers(ctx.reader_ctx.max_concurrency)
+            .num_warming_threads(ctx.reader_ctx.max_concurrency)
             .try_into()?;
         info!(
             "index reader created with reload policy=OnCommit, num_searchers={}",
@@ -480,6 +507,8 @@ impl Reader {
         let offset = qry.offset;
         let queries = self.query_handler.build_query(qry.query).await?;
         let ctx = self.schema_ctx.clone();
+        let snippet_size = qry.snippet_size;
+        let snippet_field = qry.snippet_fields;
 
         let (hits, count) = self
             .pool
@@ -498,6 +527,8 @@ impl Reader {
                         limit,
                         offset,
                         executor,
+                        snippet_size,
+                        snippet_field
                     )?
                 } else {
                     let collector = TopDocs::with_limit(limit + offset);
@@ -506,7 +537,7 @@ impl Reader {
                     )?;
 
                     (
-                        process_search(ctx.as_ref(), &searcher, schema, out.0)?,
+                        process_search(ctx.as_ref(), &searcher, schema, out.0, &queries, snippet_size, snippet_field)?,
                         out.1,
                     )
                 };
@@ -541,7 +572,7 @@ impl Reader {
     ///
     /// This is an internal export to allow the writer
     /// to have access to the segment reader information.
-    pub(crate) fn get_searcher(&self) -> LeasedItem<Searcher> {
+    pub(crate) fn get_searcher(&self) -> Searcher {
         self.pool.searcher()
     }
 }

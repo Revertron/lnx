@@ -3,22 +3,13 @@ use std::convert::TryInto;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Error, Result};
+use bincode::Options;
 use hashbrown::HashMap;
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use tantivy::collector::TopDocs;
-use tantivy::query::{
-    AllQuery,
-    BooleanQuery,
-    BoostQuery,
-    EmptyQuery,
-    FuzzyTermQuery,
-    MoreLikeThisQuery,
-    Query,
-    QueryParser,
-    TermQuery,
-};
+use tantivy::query::{AllQuery, BooleanQuery, BoostQuery, EmptyQuery, FuzzyTermQuery, MoreLikeThisQuery, PhraseQuery, Query, QueryParser, TermQuery};
 use tantivy::schema::{
     Facet,
     FacetParseError,
@@ -28,7 +19,7 @@ use tantivy::schema::{
     IndexRecordOption,
     Schema,
 };
-use tantivy::tokenizer::TokenStream;
+use tantivy::tokenizer::{Language, LowerCaser, SimpleTokenizer, Stemmer, StopWordFilter, TextAnalyzer, TokenStream};
 use tantivy::{DateTime, Index, Score, Term};
 
 use crate::corrections::SymSpellCorrectionManager;
@@ -235,9 +226,33 @@ pub enum QueryKind {
         #[serde(default)]
         fields: FieldSelector,
     },
+
+    /// Get results matching the given phrase for the given field.
+    Phrase {
+        ctx: DocumentValue,
+
+        /// [Slop](tantivy::query::PhraseQuery::set_slop) allows leniency in term proximity for some performance tradeoff.
+        #[serde(default)]
+        slop: u32,
+
+        #[serde(default)]
+        fields: FieldSelector,
+    },
+
+    /// Get results matching the given phrase for the given field.
+    PhraseMust {
+        ctx: DocumentValue,
+
+        /// [Slop](tantivy::query::PhraseQuery::set_slop) allows leniency in term proximity for some performance tradeoff.
+        #[serde(default)]
+        slop: u32,
+
+        #[serde(default)]
+        fields: FieldSelector,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum FieldSelector {
     /// A single field to search in.
@@ -414,7 +429,7 @@ pub(crate) struct QueryBuilder {
     pool: crate::ReaderExecutor,
 
     /// A basic word tokenizers for fuzzy queries.
-    tokenizer: SimpleUnicodeTokenizer,
+    tokenizer: TextAnalyzer,
 }
 
 impl QueryBuilder {
@@ -428,7 +443,12 @@ impl QueryBuilder {
         pool: crate::ReaderExecutor,
     ) -> Self {
         let parser = get_parser(&ctx, index);
-        let tokenizer = SimpleUnicodeTokenizer::with_limit(16);
+        let tokenizer = TextAnalyzer::from(SimpleTokenizer)
+            .filter(LowerCaser)
+            //.filter(StopWordFilter::new(Language::English).unwrap())
+            //.filter(StopWordFilter::new(Language::Russian).unwrap())
+            .filter(Stemmer::new(Language::English))
+            .filter(Stemmer::new(Language::Russian));
 
         Self {
             ctx: Arc::new(ctx),
@@ -500,6 +520,12 @@ impl QueryBuilder {
             },
             QueryKind::Term { ctx: query, fields } => {
                 Ok(self.make_term_query(query, fields)?)
+            },
+            QueryKind::Phrase { ctx: query, slop, fields } => {
+                Ok(self.make_phrase_query(query, slop, fields, tantivy::query::Occur::Should)?)
+            },
+            QueryKind::PhraseMust { ctx: query, slop, fields } => {
+                Ok(self.make_phrase_query(query, slop, fields, tantivy::query::Occur::Must)?)
             },
         }
     }
@@ -795,6 +821,113 @@ impl QueryBuilder {
         Ok(Box::new(BooleanQuery::new(queries)))
     }
 
+    /// Makes a query based on phrase consisting of 2+ words.
+    fn make_phrase_query(
+        &self,
+        value: DocumentValue,
+        slop: u32,
+        field: FieldSelector,
+        occur: tantivy::query::Occur,
+    ) -> Result<Box<dyn Query>> {
+        use tantivy::query::Occur;
+
+        let query = value.as_string();
+        if query.is_empty() {
+            return Ok(Box::new(EmptyQuery {}));
+        }
+
+        let phrases = extract_phrases(&query);
+        if phrases.is_empty() {
+            return Ok(Box::new(EmptyQuery {}));
+        }
+
+        //let tokenizer = TextAnalyzer::from(SimpleTokenizer).filter(LowerCaser);
+        let mut tokens = Vec::new();
+        for (phrase, quoted) in &phrases {
+            /*let mut stream = match quoted {
+                false => self.tokenizer.token_stream(phrase),
+                true => tokenizer.token_stream(phrase)
+            };*/
+            let mut stream = self.tokenizer.token_stream(phrase);
+            let mut buf = Vec::new();
+            while let Some(token) = stream.next() {
+                buf.push(token.text.clone());
+            }
+            if !buf.is_empty() {
+                tokens.push(buf);
+            }
+        }
+        if tokens.is_empty() {
+            return Ok(Box::new(EmptyQuery {}));
+        }
+
+        let fields = {
+            match field {
+                FieldSelector::DefaultFields => self.ctx.default_search_fields.clone(),
+                FieldSelector::Single(field) => {
+                    vec![(self.get_searchable_field(&field)?, 1.0)]
+                },
+                FieldSelector::Multi(fields) => {
+                    if fields.is_empty() {
+                        return Err(anyhow!(
+                            "At least one field must be specified, to use the default fields \
+                            leave this field out of the query."
+                        ));
+                    }
+
+                    let mut search_fields = Vec::with_capacity(fields.len());
+                    for field in fields {
+                        search_fields.push((self.get_searchable_field(&field)?, 1.0));
+                    }
+
+                    search_fields
+                },
+                FieldSelector::MultiWithBoost(fields) => {
+                    if fields.is_empty() {
+                        return Err(anyhow!(
+                            "At least one field must be specified, to use the default fields \
+                            leave this field out of the query."
+                        ));
+                    }
+
+                    let mut search_fields = Vec::with_capacity(fields.len());
+                    for (field, score) in fields {
+                        search_fields.push((self.get_searchable_field(&field)?, score));
+                    }
+
+                    search_fields
+                },
+            }
+        };
+
+        let mut queries: Vec<(Occur, Box<dyn Query>)> = vec![];
+        for (field, boost) in fields {
+            for phrase in tokens.iter() {
+                if phrase.len() == 1 {
+                    let term = Term::from_field_text(field, phrase.get(0).unwrap());
+                    let query = TermQuery::new(term, IndexRecordOption::WithFreqsAndPositions);
+                    queries.push((occur, (Box::new(query) as Box<dyn Query>).into()));
+                } else {
+                    let mut field_terms = vec![];
+                    for word in phrase.iter() {
+                        let term = Term::from_field_text(field, word);
+                        field_terms.push(term);
+                    }
+                    let mut phrase_query = PhraseQuery::new(field_terms);
+                    phrase_query.set_slop(slop);
+
+                    if boost != 1.0 {
+                        queries.push((occur, Box::new(BoostQuery::new(Box::new(phrase_query), boost))));
+                    } else {
+                        queries.push((occur, (Box::new(phrase_query) as Box<dyn Query>).into()));
+                    }
+                }
+            }
+        }
+
+        Ok(Box::new(BooleanQuery::new(queries)))
+    }
+
     fn get_searchable_field(&self, field: &str) -> Result<Field> {
         let field = self.schema.get_field(field).ok_or_else(|| {
             Error::msg(format!("no field exists with name: {:?}", field))
@@ -809,6 +942,43 @@ impl QueryBuilder {
 
         Ok(field)
     }
+}
+
+fn extract_phrases(text: &str) -> Vec<(String, bool)> {
+    let mut result = Vec::new();
+    let mut inside_quotes = false;
+    let mut current_phrase = String::new();
+
+    for c in text.chars() {
+        match c {
+            '"' => {
+                if inside_quotes {
+                    result.push((current_phrase.clone(), inside_quotes));
+                    current_phrase.clear();
+                }
+                inside_quotes = !inside_quotes;
+            }
+            ' ' => {
+                if inside_quotes {
+                    current_phrase.push(c);
+                } else {
+                    if !current_phrase.is_empty() {
+                        result.push((current_phrase.clone(), inside_quotes));
+                    }
+                    current_phrase.clear();
+                }
+            }
+            _ => {
+                current_phrase.push(c);
+            }
+        }
+    }
+
+    if !current_phrase.is_empty() {
+        result.push((current_phrase, inside_quotes));
+    }
+
+    result
 }
 
 fn get_parser(ctx: &QueryContext, index: &Index) -> QueryParser {
@@ -863,4 +1033,15 @@ fn convert_to_term(
     };
 
     Ok(term)
+}
+
+#[test]
+fn selector() {
+    let mut map = HashMap::new();
+    map.insert("author".to_owned(), 1.5);
+    map.insert("title".to_owned(), 1.5);
+    map.insert("content".to_owned(), 1.0);
+    let sel = FieldSelector::MultiWithBoost(map);
+    let string = serde_json::to_string(&sel).unwrap();
+    println!("Selector: {:?}", &string);
 }

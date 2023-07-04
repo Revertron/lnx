@@ -8,6 +8,7 @@ use tantivy::tokenizer::{
 };
 
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct SimpleUnicodeTokenizer {
     limit: usize,
 }
@@ -18,6 +19,7 @@ impl Default for SimpleUnicodeTokenizer {
     }
 }
 
+#[allow(dead_code)]
 impl SimpleUnicodeTokenizer {
     pub fn with_limit(num_words: usize) -> Self {
         Self { limit: num_words }

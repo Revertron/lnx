@@ -18,7 +18,7 @@ use tantivy::schema::{
     INDEXED,
     STORED,
 };
-use tantivy::Score;
+use tantivy::{DateOptions, Score};
 
 use crate::helpers::{Calculated, Validate};
 
@@ -433,6 +433,36 @@ pub struct CalculatedIntOptions {
 impl From<CalculatedIntOptions> for NumericOptions {
     fn from(v: CalculatedIntOptions) -> Self {
         let mut opts = NumericOptions::default();
+
+        if v.indexed {
+            opts = opts.set_indexed();
+        }
+
+        if v.base.stored {
+            opts = opts.set_stored();
+        }
+
+        if v.fieldnorms.unwrap_or(v.indexed) {
+            opts = opts.set_fieldnorm();
+        }
+
+        if v.fast {
+            let cardinality = if v.base.multi {
+                Cardinality::MultiValues
+            } else {
+                Cardinality::SingleValue
+            };
+
+            opts = opts.set_fast(cardinality);
+        }
+
+        opts
+    }
+}
+
+impl From<CalculatedIntOptions> for DateOptions {
+    fn from(v: CalculatedIntOptions) -> Self {
+        let mut opts = DateOptions::default();
 
         if v.indexed {
             opts = opts.set_indexed();

@@ -292,6 +292,8 @@ impl InternalIndex {
                 offset,
                 order_by: None,
                 sort: Default::default(),
+                snippet_size: None,
+                snippet_fields: Vec::new(),
             };
 
             let results = self.search(query).await?;

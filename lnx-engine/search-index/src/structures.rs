@@ -9,10 +9,10 @@ use hashbrown::HashMap;
 use serde::de::value::{MapAccessDeserializer, SeqAccessDeserializer};
 use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use tantivy::fastfield::FastValue;
-use tantivy::schema::{Facet, FacetParseError, Field, FieldType, Schema, Value};
+use tantivy::schema::{Facet, FacetParseError, Field, FieldType, NamedFieldDocument, Schema, Value};
 use tantivy::time::OffsetDateTime;
 use tantivy::{DateTime, Document as InternalDocument, Index, Score};
+use tantivy::tokenizer::{Language, LowerCaser, SimpleTokenizer, Stemmer, StopWordFilter};
 use time::format_description::well_known::Rfc3339;
 
 use crate::corrections::{SymSpellCorrectionManager, SymSpellManager};
@@ -187,7 +187,14 @@ impl IndexDeclaration {
 
         index
             .tokenizers()
-            .register("default", SimpleUnicodeTokenizer::default());
+            .register("default",
+                      tantivy::tokenizer::TextAnalyzer::from(SimpleTokenizer)
+                          .filter(LowerCaser)
+                          //.filter(StopWordFilter::new(Language::English).unwrap())
+                          //.filter(StopWordFilter::new(Language::Russian).unwrap())
+                          .filter(Stemmer::new(Language::English))
+                          .filter(Stemmer::new(Language::Russian))
+            );
 
         Ok(IndexContext {
             name: self.name.clone(),
@@ -396,7 +403,7 @@ impl TryInto<u64> for DocumentValue {
             Self::I64(v) => v as u64,
             Self::F64(v) => v as u64,
             Self::U64(v) => v,
-            Self::Datetime(dt) => dt.as_u64(),
+            Self::Datetime(dt) => dt.into_timestamp_millis() as u64,
             Self::Text(v) => v
                 .parse::<u64>()
                 .map_err(|_| Error::msg("cannot convert value into u64 value"))?,
@@ -847,7 +854,7 @@ impl DocumentHit {
     pub fn from_tantivy_document(
         ctx: &SchemaContext,
         doc_id: u64,
-        mut doc: tantivy::schema::NamedFieldDocument,
+        mut doc: NamedFieldDocument,
         score: Option<Score>,
     ) -> Self {
         let mut compliant = HashMap::with_capacity(doc.0.len());
